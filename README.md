@@ -1,4 +1,4 @@
-# Discovering Video Memory by Building Your Own Screen Sharing Tool
+# Explore video memory by creating your own screen sharing
 
 ## Introduction
 
