@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  server:
+    build: ./src/server
+    container_name: udp_server
+    volumes:
+      - ./src/server:/app
+    working_dir: /app
+    networks:
+      - udpnet
+    tty: true
+
+  client:
+    build: ./src/client
+    container_name: udp_client
+    volumes:
+      - ./src/client:/app
+    working_dir: /app
+    networks:
+      - udpnet
+    tty: true
+    depends_on:
+      - server
+
+networks:
+  udpnet:
+    driver: bridge
