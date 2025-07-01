@@ -1,518 +1,504 @@
-# Découvrir la mémoire vidéo en créant son propre partage d'écran
+# Discovering Video Memory by Building Your Own Screen Sharing Tool
 
 ## Introduction
 
-Sous Linux, l’affichage graphique résulte d’une collaboration étroite entre
-le noyau, le GPU et divers services en espace utilisateur.
+On Linux, graphical display is the result of close cooperation between the
+kernel, the GPU, and various user-space services.
 
-Cet article propose une exploration progressive de ces mécanismes, suivie
-d’une mise en pratique : **la création d’un programme minimal de capture
-d’écran.**
+This article offers a gradual exploration of these mechanisms, followed by a
+hands-on project: **creating a minimal screenshot capture program.**
 
-Nous passerons par les principales couches logicielles du système graphique
-Linux : **framebuffer**, **DRM** (avec GEM et KMS), **compositeur graphique**,
-**xdg-desktop-portal** et **PipeWire**.
+We will go through the main software layers of the Linux graphics system:
+**framebuffer**, **DRM** (with GEM and KMS), **graphics compositor**,
+**xdg-desktop-portal**, and **PipeWire**.
 
-Ce que vous allez apprendre :
-- Ce qu’est un framebuffer et comment il est manipulé par le kernel Linux ;
-- Comment une image arrive-t-elle réellement sur votre écran ;
-- Comment capturer une image de l’écran de manière sécurisée ;
+This article will help you understand:
 
-Ce premier article pose les fondations techniques. Nous coderons une
-**version simple du client de partage d’écran**, avec une seule capture envoyée
-au serveur. La capture en continu pourra faire l’objet d’un second article.
+* What a framebuffer is and how the Linux kernel handles it;
+* How images are actually rendered on your screen;
+* How to capture a screen image securely;
 
-## Prérequis
+It lays the technical foundations. We will code a **simple version of a
+screen-sharing client**, with a single screenshot sent to the server.
+Continuous capture could be covered in a second article.
 
-Cet article s’adresse à des lecteurs ayant déjà quelques bases en informatique
-et programmation système.
+## Prerequisites
 
-Pour bien suivre les explications et les exemples de code, il est recommandé
-de connaître :
-- les **principes de base d’un système Linux** : ce qu’est le kernel, la notion
-de périphériques `/dev`, etc.
-- la différence entre **userland** (espace utilisateur) et **kernel space**
-(espace noyau) ;
-- les fondamentaux du langage **C** : pointeurs, structures, fonctions ;
-- la notion de **mémoire RAM** ;
+This article is intended for readers who already have some knowledge of
+computer science and system programming.
 
-Aucune connaissance préalable de DRM, KMS, PipeWire ou libportal n’est
-nécessaire : tout sera expliqué au fur et à mesure.
+To follow the explanations and code examples smoothly, you should be familiar
+with:
 
-## Comment sont stockées et affichées les images à l’écran ?
+* the **basics of a Linux system**;
+* the difference between **userland** and **kernel space**;
+* the fundamentals of the **C language**: pointers, structures, functions;
+* the concept of **RAM** memory;
 
-La mémoire vidéo correspond à la partie spécifique de la mémoire destinée à
-stocker les informations à afficher à l'écran. Elle est représentée sous la
-forme d'un buffer appelé **framebuffer** qui est stocké dans la mémoire
-dynamique.
+You don't need any prior knowledge of DRM, KMS, PipeWire, or libportal.
+Everything will be explained step by step.
+
+## How are images stored and displayed on the screen?
+
+Video memory refers to the specific part of memory dedicated to storing
+information to be displayed on screen. It is represented as a buffer called a
+**framebuffer**, stored in dynamic memory.
+
 ### Framebuffer
 
-Un framebuffer est un espace alloué en mémoire permettant de stocker les
-informations destinées à être affichées à l’écran. Chaque pixel est représenté
-par 4 octets (RGBA), sa taille peut être calculée avec la formule suivante :
-_taille = largeur × hauteur × 4 octets_.
+A framebuffer is an allocated memory space used to store information meant to be
+displayed on screen. Each pixel is represented by 4 bytes (RGBA), and its size
+can be calculated using the following formula:
+*size = width × height × 4 bytes*.
 
-Avec des fréquences de 60 à 240 Hz et des résolutions jusqu’à la 4K,
-les écrans modernes imposent des calculs rapides pour actualiser continuellement
-le framebuffer, ce qui nécessite un composant graphique spécialisé.
+With refresh rates ranging from 60 to 240 Hz and resolutions up to 4K, modern
+displays require fast calculations to continuously update the framebuffer, whi h
+necessitates a specialized graphics component.
 
-### Quel composant gère la mémoire vidéo ?
+### Which component manages video memory?
 
-Pour effectuer ces calculs rapidement, l'ordinateur utilise une carte
-graphique (GPU). Celle-ci peut être intégrée au processeur (**iGPU**) ou
-externe (**GPU dédié**). Le GPU est spécialement conçu pour les calculs
-graphiques.
+To perform these calculations quickly, the computer uses a graphics card (GPU).
+This GPU may be integrated into the processor (**iGPU**) or external
+(**dedicated GPU**). The GPU is specifically designed for graphical
+computations.
 
-Les GPU dédiés disposent de leur propre mémoire, la **VRAM (Video RAM)**,
-conçue pour offrir une **bande passante élevée** et un **accès ultra-rapide**
-ce qui permet de meilleures performances de rafraichissement.
+Dedicated GPUs have their own memory, called **VRAM (Video RAM)**, designed to
+offer **high bandwidth** and **ultra-fast access**, enabling better refresh
+performance.
 
-Lorsqu’un GPU dédié est utilisé, le framebuffer est stocké dans sa
-mémoire vidéo (VRAM). En l’absence de GPU et de VRAM, c’est la RAM qui héberge
-le framebuffer, et l’iGPU prend alors en charge les calculs d’affichage.
+When a dedicated GPU is used, the framebuffer is stored in its video memory
+(VRAM). If there is no GPU or VRAM, the framebuffer is stored in regular RAM,
+and the iGPU handles display rendering tasks
 
-### Fonctionnement général sur Linux côté Kernel
+### Video management in kernel space
 
-Nous avons vu que le framebuffer contient les pixels à afficher. Mais comment
-ces données sont-elles envoyées concrètement à l’écran ?
-Pour comprendre cela, plusieurs questions se posent : 
+We've seen that the framebuffer holds the pixels to be displayed. But how is
+this data actually sent to the screen ?
 
-* Qui gère les framebuffers ?
-* Comment sont-ils créés ?
-* Comment le framebuffer est-il relié à l'écran ?
-* Comment le curseur de notre souris est-il affiché ?
+To understand that, several questions arise:
+
+* Who manages framebuffers?
+* How are framebuffers created?
+* How is the framebuffer connected to the screen?
+* How is the mouse cursor displayed?
 
 ### Direct Rendering Manager (DRM)
 
-**DRM** (*Direct Rendering Manager*) est un sous-système du noyau Linux chargé
-de la gestion de l’affichage graphique. Il permet à des applications en
-espace utilisateur d’interagir avec le matériel graphique de manière sécurisée
-et standardisée.
+**DRM** (*Direct Rendering Manager*) is a Linux kernel subsystem that handles
+graphical display management. It allows user-space applications to interact with
+graphics hardware in a secure and standardized way.
 
-Il prend en charge l’allocation des framebuffers, leur gestion,
-leur association à un affichage physique et leur exposition
-via des interfaces comme `/dev/dri/card0`.
+It handles framebuffer allocation, management, their association with a
+physical display, and exposes them through interfaces like `/dev/dri/card0`.
 
-DRM se divise en trois composants principaux :
-- **DRM Core**
-- **GEM (Graphics Execution Manager)**
-- **KMS (Kernel Mode Setting)**
+DRM consists of three main components:
+
+* **DRM Core**
+* **GEM (Graphics Execution Manager)**
+* **KMS (Kernel Mode Setting)**
 
 #### DRM Core
 
-Le DRM core coordonne les interactions entre **GEM** et **KMS** et assure
-l'interfaçage avec l'espace utilisateur via le périphérique `/dev/dri/card0`.
+The DRM core coordinates the interactions between **GEM** and **KMS**, and
+ensures user-space interfacing via the `/dev/dri/card0` device.
 
-#### Graphical Execution Manager (GEM)
+#### Graphics Execution Manager (GEM)
 
-En réalité, les framebuffers sont gérés sous forme de **GEM framebuffers**,
-c’est-à-dire des buffers graphiques alloués et manipulés par le gestionnaire
-GEM.
+In reality, framebuffers are handled as **GEM framebuffers** — graphic buffers
+allocated and managed by the GEM manager.
 
-GEM gère le CRUD des GEM framebuffers. Chaque framebuffer GEM est constitué :
-* d'un identifiant (`gem_handle`)
-* d'un buffer contenant les données des pixels (le framebuffer).
+GEM handles the CRUD operations for GEM framebuffers. Each GEM framebuffer
+contains:
 
-Chaque élément visible à l’écran (fenêtre, vidéo, curseur…) repose sur un
-**GEM framebuffer distinct**, assemblé visuellement par KMS.
+* an ID (`gem_handle`)
+* a buffer containing pixel data (the framebuffer)
+
+Every visible element on screen (window, video, cursor...) relies on a
+**distinct GEM framebuffer**, visually assembled by KMS.
 
 #### Kernel Mode Setting (KMS)
 
-KMS est la partie du noyau Linux responsable de **configurer l’affichage** et
-de **composer les différentes couches graphiques** à l’écran.
-Il assemble les images provenant de plusieurs buffers
-(fenêtres, vidéos, curseur…) et produit la sortie finale envoyée à l’écran.
+KMS is the part of the Linux kernel responsible for **configuring the display**
+and **compositing the different graphical layers** on screen. It combines images
+from multiple buffers (windows, videos, cursor...) and produces the final output
+sent to the screen.
 
-Pour cela, KMS s’appuie sur plusieurs concepts clés :
+To do this, KMS relies on several key concepts:
 
 ##### KMS Buffer
 
-Un **KMS Buffer** est une structure utilisée par KMS pour manipuler
-un **framebuffer**. Il contient:
-- un pointeur vers le framebuffer (géré par GEM) ;
-- des informations complémentaires comme la taille, le format des pixels,
-ou l’emplacement mémoire ;
+A **KMS Buffer** is a structure used by KMS to handle
+a **framebuffer**. It contains:
 
-Autrement dit, **le KMS Buffer est l’enveloppe qui décrit comment utiliser un
-framebuffer dans la chaîne d’affichage gérée par KMS.**
+* a pointer to the framebuffer (managed by GEM);
+* additional information such as size, pixel format, or memory location;
+
+In other words, **the KMS Buffer is a wrapper describing how to use a
+framebuffer within the display pipeline orchestrated by KMS**
 
 ##### Plane
 
-Un **Plane** représente une couche d’image que le système peut afficher à
-l’écran. Chaque Plane est associé à un **KMS Buffer** contenant l’image à
-afficher, ainsi qu’à une **couche de composition** (layer).
+A **Plane** is an image layer that can be rendered on screen by the system.
+Each Plane is associated with a **KMS Buffer** containing the image to display,
+as well as a **composition layer**.
 
-Il existe plusieurs types de couches selon leur fonction :
+There are several types of layers depending on their function:
 
-- **Primary** : couche principale (le fond, typiquement le bureau) ;
+* **Primary**: the main layer (the background, typically the desktop);
+* **Overlay**: an intermediate layer (e.g., a playing video);
+* **Cursor**: the mouse cursor layer;
 
-- **Overlay** : couche intermédiaire (ex. : vidéo en lecture) ;
+KMS can stack multiple Planes to construct the final image.
 
-- **Cursor** : couche du curseur de la souris ;
+Simplified representation:
 
-KMS peut superposer plusieurs Planes pour construire l’image finale.
-
-Représentation simplifiée :
 ```c
 struct Plane {
-    struct KMS_Buffer buffer; // Image à afficher
-    enum layers layer;              // Type de couche (Primary, Overlay, Cursor)
+    struct KMS_Buffer buffer; // Image to display
+    enum layers layer;        // Layer type (Primary, Overlay, Cursor)
 };
 ```
 
-##### CRTC, Encodeur & Connecteur
+##### CRTC, Encoder & Connector
 
-- **CRTC** (Cathode Ray Tube Controller) : est chargé de combiner les
-différents Planes et de générer l’image finale envoyée à l’écran.
+* **CRTC** (Cathode Ray Tube Controller): combines
+  the different Planes and generates the final image sent to the screen.
 
-- **Encodeur** : adapte le signal vidéo généré par le CRTC au format
-requis (HDMI, DisplayPort, etc.)
+* **Encoder**: converts the video signal generated by the CRTC
+  into the required format (HDMI, DisplayPort, etc.)
 
-- **Connecteur** : correspond à la **prise physique** reliée à
-l’écran (port HDMI, VGA, etc.)
+* **Connector**: corresponds to the **physical port** connected
+  to the screen (HDMI, VGA, etc.)
 
-Pour résumer :
- - **DRM core** assure l’interface entre le noyau et l’espace utilisateur ;
- - **GEM** gère les framebuffers côté kernel ;
- - **KMS** assemble ces buffers pour composer l’image finale envoyée à l’écran ;
+To sum up:
 
-Nous allons maintenant voir comment on peut communiquer avec DRM en userland
-pour notre exemple de partage d'écran.
+* **DRM core** ensures interfacing between the kernel and user space;
+* **GEM** manages framebuffers on the kernel side;
+* **KMS** assembles these buffers to compose the final image sent to the screen;
 
-<TODO Insert schema de la gestion video kernel*>
+Let's now explore how to interact with DRM from userland for our screen sharing
+example.
 
-## Gestion de la vidéo en userland
+\<TODO Insert kernel video diagram\*>
 
-Nous avons vu comment le noyau (kernel) gère l'affichage les composants DRM.
-Mais pour créer un programme de partage d'écran, il ne suffit pas de comprendre
-le fonctionnement du kernel : il faut aussi savoir comment interagir avec la
-vidéo depuis l’espace utilisateur (userland) où est stocké notre programme.
+## Video management in userland
 
-### Accès au système graphique : `/dev/dri/card0`
+We've seen how the kernel handles display via DRM components. But to create a
+screen sharing program, understanding the kernel isn't enough:
+we also need to know how to interact with video from user space, where our
+program is located.
 
-`/dev/dri/card0` est une interface exposée sous forme de file descriptor (fd),
-qui permet la communication entre l’espace utilisateur (*userland*) et
-DRM (kernel).
+### Accessing the graphics system: `/dev/dri/card0`
 
-Pour envoyer des requêtes via cette interface, on utilise la
-bibliothèque **libDRM**, qui fournit des fonctions bas-niveau pour interagir
-avec DRM.
+`/dev/dri/card0` is an interface exposed as a file descriptor (fd), which allows
+communication between userland and DRM (kernel).
 
-À première vue, on pourrait se dire qu’il suffit d’utiliser directement
-**libDRM** pour accéder au contenu de l’écran.
-Mais cela ne prend pas en compte un élément fondamental de notre système : 
-**le compositeur graphique**, qui utilise lui-même **libDRM** et 
-`/dev/dri/card0` pour gérer l’affichage.
+To send requests via this interface, we use the **libDRM** library, which
+provides low-level functions for interacting with DRM.
 
-Tenter d’ouvrir une connexion directe avec DRM en parallèle du compositeur
-entraînerait un conflit. C’est pourquoi, dans notre cas, il est indispensable
-de passer par le compositeur. Nous allons à présent voir ce qu’est un
-compositeur graphique, quel rôle il joue dans le système d’affichage,
-et comment notre programme peut communiquer avec lui.
+At first glance, it may seem that using **libDRM** directly is enough to access
+screen content. But this ignores a key component of the system:
+**the graphics compositor**, which also uses **libDRM** and `/dev/dri/card0`
+to manage display.
 
-### Le compositeur graphique
+Trying to connect directly to DRM alongside the compositor would cause a
+conflict. That's why, in our case, we must go through the compositor.
 
-Le **compositeur graphique** est le programme qui gère l’interface visuelle :
-il dessine les fenêtres, le curseur, et contrôle l’apparence du système.
-Il s'occupe aussi de l’accès à l’affichage, empêchant toute application de
-capturer l’écran sans autorisation. 
+Let's now examine the graphics compositor and the role it plays in the display
+system and how our program can communicate with it.
 
-Sans lui, il n'y aurait pas de souris ni de fenêtres mais juste un terminal
-texte.
+### The graphics compositor
 
-Toute demande de capture d’écran doit passer par lui. Il est donc indispensable
-de le prendre en compte si l’on veut créer notre programme de partage d'écran.
-Les systèmes Linux utilisent principalement deux architectures graphiques :
+The **graphics compositor** is the program that manages the visual interface:
+it draws windows, the cursor, and controls the system's appearance.
+It also handles access to display, preventing any application from capturing
+the screen without permission.
 
-* **X11** : Ancien protocole, avec une gestion centralisée de l'affichage.
-* **Wayland** (GNOME, KDE): Plus récent, léger, sécurisé et performant,
-Wayland isole les applications les unes des autres pour empêcher les accès
-non autorisés à l’affichage.
+Without it, there would be no mouse or windows — only a text terminal.
 
-Nous avons vu comment les flux vidéo sont partagés entre le noyau (via DRM) et
-le compositeur graphique, ainsi que le rôle central que ce dernier joue dans
-l’affichage.  
-Maintenant, nous allons voir comment notre programme de partage d’écran peut
-communiquer avec le compositeur pour accéder au contenu de l’écran.
+Every screenshot request needs to pass through the compositor. So it's essential
+to consider it if we want to create our screen sharing program.
 
-### Interaction avec la mémoire vidéo
+Linux systems mainly use two graphical architectures:
 
-Avant de capturer l’écran, notre programme doit obtenir l’autorisation du
-compositeur de lire le flux vidéo de notre écran. Une fois que le compositeur
-accepte, il lui fournit de quoi s'abonner à ce flux pour recevoir la donnée
-sous forme de buffers en mémoire.
+* **X11**: old protocol with centralized display management;
+* **Wayland** (GNOME, KDE): newer, lighter, more secure and efficient. Wayland
+isolates applications from one another to prevent unauthorized display access.
 
-La prochaine étape consiste à comprendre par quel mécanisme cette demande
-d’accès est effectuée.
+We've seen how video streams are shared between the kernel (via DRM) and the
+graphics compositor, and the central role it plays in the entire display
+process.
 
-#### Accès sécurisé à l’écran : xdg-desktop-portal et PipeWire
+Now let's see how our screen sharing program can communicate
+with the compositor to access screen content.
 
-Sous **Wayland**, une application ne peut pas accéder directement au contenu
-de l’écran. Pour des raisons de sécurité, seul le compositeur graphique peut
-autoriser ou refuser cet accès.
+## Interaction with Video Memory
 
-Or, les applications n'ont pas de moyen de communication direct avec le
-compositeur. Elles doivent donc passer par une interface intermédiaire :
-le portail graphique **xdg-desktop-portal**.
+Before capturing the screen, our program must **obtain permission** from the
+compositor to read the video stream of our screen.
+Once the compositor grants access, it enables the application to subscribe to
+the stream and retrieve the data as memory buffers.
 
-Ce portail agit comme un **intermédiaire sécurisé** : il transmet la demande au
-compositeur, affiche une boîte de dialogue à l’utilisateur, puis relaye la
-réponse (autorisation ou refus) à l’application.
-Il permet ainsi à une application non privilégiée de **demander un accès
-contrôlé à l’écran, avec l’accord explicite de l’utilisateur**.
+The next step is to understand **which mechanism is used to make this access
+request**.
 
-Ce portail est composé de trois parties :
+### Secure Screen Access: xdg-desktop-portal and PipeWire
 
-- **Frontend** : accessible par notre application, il expose des méthodes
-simples à appeler ;
+On **Wayland**, an application cannot directly access the screen content.
+For security reasons, **only the graphics compositor** can grant or deny that
+access.
 
-- **Daemon** : relie le frontend au backend et assure la coordination ;
+However, applications **have no direct means of communication** with the
+compositor. They must go through an intermediate interface:
+the **xdg-desktop-portal** graphical portal.
 
-- **Backend** : communique avec le compositeur dans notre cas ;
+This portal acts as a **secure intermediary**: it sends the request to the
+compositor, displays a dialog box to the user, and then relays the
+response (permission granted or denied) back to the application.
+It thus allows an non-privileged application to **request controlled access to
+the screen, with the user's explicit consent**.
 
-### Déroulement d’une capture d’écran
+This portal consists of three parts:
 
-La capture d’écran via **xdg-desktop-portal** suit trois étapes :
+* **Frontend**: exposed to our application, it provides simple methods to call;
+* **Daemon**: links the frontend to the backend and manages coordination;
+* **Backend**: communicates with the compositor in our case;
 
-1. `CreateSession` : une session peut être comparée à une requête et son suivi.
+### How Screenshot Capture Works
 
-2. `SelectSources` : l’utilisateur choisit ce qu’il veut partager
-(écran complet, fenêtre, etc.).
+Screenshot capture via **xdg-desktop-portal** happens in three steps:
 
-3. `Start` : le portail valide la demande, puis crée le **flux vidéo**
-via **Pipewire**
+1. `CreateSession`: a session can be seen as a request and its tracking context.
+2. `SelectSources`: the user chooses what to share (full screen, a window, etc).
+3. `Start`: the portal approves the request, then the compositor creates the
+**video stream** via **PipeWire**.
 
-Une fois la session démarrée, le portail renvoie deux informations :
-- un **file descriptor (fd)** : une **socket Unix** permettant à notre
-application de se connecter au serveur PipeWire ;
-- un **node ID** : un **identifiant unique du flux vidéo**, utilisé pour
-s’abonner au bon flux (celui venant d'être crée)
+Once the session is started, the portal returns two values:
 
-### PipeWire : le transport du flux
+* a **file descriptor (fd)**, which is a Unix socket allowing our application
+to connect to the PipeWire server;
+* a **node ID**, which is a **unique identifier of the video stream**, used to
+subscribe to the correct stream (the one just created);
 
-**PipeWire** est un **serveur multimédia** conçu pour transporter des flux audio
-et vidéo (comme le son, la webcam ou l’écran) avec une latence très faible.
+### PipeWire: Handling the Video Stream
 
-Dans notre cas, c’est **PipeWire** qui transmet les images de l’écran depuis
-le compositeur vers notre application. Grâce au **file descriptor** et au
-**node ID** fournis par le portail, notre programme peut se connecter au bon
-flux et recevoir les images de l’écran sous forme de buffers.
+**PipeWire** is a **multimedia server** designed to carry audio and video
+streams (such as sound, webcam, or screen) with **very low latency**.
 
-**En résumé** :
-**xdg-desktop-portal** sert à formuler une demande sécurisée au compositeur
-pour accéder à l’écran, avec l’accord explicite de l’utilisateur.
-Une fois cette demande acceptée, **PipeWire** prend le relais pour mettre en
-place un flux vidéo, permettant au compositeur d’envoyer les images de l’écran
-à l’application.
+In our case, **PipeWire** transmits the screen content from the compositor to
+our application. Thanks to the **file descriptor** and **node ID** provided by
+the portal, our program can **connect to the correct stream** and receive the
+screen frames as memory buffers.
 
-### Technologie simplifiante
+**In summary**:
+**xdg-desktop-portal** is used to make a secure request to the compositor to
+access the screen, with the user's explicit consent.
+Once that request is accepted, **PipeWire** takes over and sets up the video
+stream, allowing the compositor to send the screen images to the application.
 
-Comme on a pu le voir, la mise en place d’une capture d’écran via
-**xdg-desktop-portal** et **PipeWire** peut sembler complexe. Heureusement,
-il existe des bibliothèques pour simplifier cette interaction.
+### Simplifying Technologies
+
+As we've seen, setting up a screenshot capture with **xdg-desktop-portal** and
+**PipeWire** can seem complex. Fortunately, there are libraries that simplify
+this interaction.
 
 #### libportal
 
-**libportal** est une bibliothèque C qui fournit une interface simple pour
-utiliser **xdg-desktop-portal**. Elle masque toutes les étapes complexes 
-(création de session, sélection des sources, gestion des réponses…) derrière
-une API simple.
+**libportal** is a C library that provides a simple interface to use
+**xdg-desktop-portal**. It hides all the complex steps (session creation,
+source selection, response handling...) behind a simple API.
 
-Maintenant que nous comprenons l’ensemble du mécanisme — de la mémoire vidéo au
-compositeur, en passant par le portail et PipeWire —, nous allons passer à la
-pratique : 
-**mettre en œuvre une première version de notre programme de partage d’écran**.
+Now that we understand the whole mechanism — from video memory to the
+compositor, via the portal and PipeWire —, let's now move on to the practical
+part: **implementing a first version of our screen sharing program.**
 
-## Vers une application de partage d’écran
+## Getting Started with a Screen Sharing Application
 
-L’objectif de cette partie est de **commencer un programme de partage d’écran**,
-en codant une **première version simplifiée** :
+In this section, we'll implement a **first minimal version** of a **screen
+sharing program**.
 
-Le client capture une image de l’écran, la transforme en format brut (raw),
-puis l’envoie au serveur via le réseau.
+### Technical Overview
 
-### Aperçu technique
+Here are the main steps of how our application works:
 
-Voici les grandes étapes du fonctionnement de notre application :
+1. The **client** uses `libportal` to capture a screenshot;
+2. It converts the PNG image to raw pixel data (RGBA);
+3. It sends this data over **UDP** to a server;
+4. The server receives and reconstructs the image in a simple format (PPM).
 
-1. Le **client** utilise `libportal` pour capturer une image de l’écran ;
-2. Il transforme cette image PNG en données brutes (pixels RGBA) ;
-3. Il envoie ces données via **UDP** à un serveur ;
-4. Le serveur reçoit et reconstitue l’image dans un format simple (PPM).
+To simplify the implementation, we will use:
 
-Pour simplifier l’implémentation, nous utiliserons :
-- `libportal` : pour accéder facilement au portail **xdg-desktop-portal** ;
-- `GLib/GIO` : indispensable au fonctionnement de libportal, elle fournit la
-boucle d’événements asynchrone requise et constitue la base des
-applications GNOME ;
-- `GdkPixbuf` : pour convertir l’image PNG en raw ;
+* `libportal`: to easily access the **xdg-desktop-portal**;
+* `GLib/GIO`: required for `libportal` to work; it provides the asynchronous
+event loop and is the foundation of GNOME applications;
+* `GdkPixbuf`: to convert the PNG image into raw format;
 
-Les performances réseau sont optimisées grâce à **UDP** et **IO_uring**,
-déjà implémentés dans le projet. Nous n’entrerons toutefois pas dans les
-détails ici, afin de rester concentrés sur le fonctionnement global.
+Network performance is optimized using **UDP** and **IO\_uring**, which are
+already implemented in the project. However, we will not go into detail here to
+stay focused on the overall logic.
 
-### Implémentation : capture côté client
+### Implementation: client-side capture
 
-Commençons par écrire une fonction `capture_screenshot()` en C, qui capture
-l’écran et récupère l’image au format PNG.
+Let's begin by writing a `capture_screenshot()` function in C, which captures
+the screen and retrieves the image in PNG format.
 
-Nous allons utiliser les fonctions de libportal :
+We'll use the following `libportal` functions:
 
-- `xdp_portal_new()`: créer un XDG Portal.
-- `xdp_portal_take_screenshot()`: Lance une capture d'écran async
-- `xdp_portal_take_screenshot_finish()`: Fini la capture et retourne le
-PNG resultant
-- `XDP_PORTAL()`: Permet de cast
+* `xdp_portal_new()`: creates an XDG portal instance;
+* `xdp_portal_take_screenshot()`: starts an asynchronous screenshot capture;
+* `xdp_portal_take_screenshot_finish()`: completes the capture and returns the
+resulting PNG;
+* `XDP_PORTAL()`: used to cast to the right type;
 
-Ainsi que les GLIB event loop permettant de mettre en attente notre programme.
+We'll also rely on the GLib event loop to hold execution until the asynchronous
+callback completes
 
-Nous allons commencer par définir une structure permettant de stocker toutes
-les informations dont on aura besoin :
+Let's first define a structure to store all the information we'll need:
 
-```C
-struct {
-	GMainLoop *loop;           //GLIB event loop pour gérer l'async
-    guchar    *data;           //Buffer où on stocke l'image
-    gsize      length;         //Taille du buffer
-    guint32    width, height;  //Les dimensions de l'image
-    XdpPortal *portal;         //Le portail
-} screen_data;
+```c
+struct screen_data {
+    GMainLoop *loop;           // GLib event loop for async handling
+    guchar    *data;           // Buffer to store the image
+    gsize      length;         // Buffer size
+    guint32    width, height;  // Image dimensions
+    XdpPortal *portal;         // Portal instance
+};
 ```
 
-Puis nous allons implémenter notre fonction `capture_screenshot()`:
+The next step is to implement our `capture_screenshot()` function:
 
-```C
+```c
 int capture_screenshot(struct screen_data* sd)
 {
-    //Init une GLIB event loop
+    // Initialize a GLib event loop
     g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
 
-    //Stocke la GLIB event loop dans la struct
+    // Store the loop in the struct
     sd->loop = loop;
 
-    //Créer le portail XDG et le stocke dans la struct
+    // Create the XDG portal and store it in the struct
     sd->portal = xdp_portal_new();
 
-    // Démarre la capture d’écran de façon asynchrone :
-    // - sd->portal   : Objet qui gère la capture (notre portail)
-    // - NULL         : Fenêtre parent (aucune)
-    // - XDP_SCREENSHOT_FLAG_NONE : Pas d'option
-    // - NULL         : Aucun détail supplémentaire
-    // - on_screenshot_ready : Callback appelé une fois la capture faite
-    // - sd           : notre data qu'on veut donner à la callback
+    // Start the async screenshot capture :
+    // - sd->portal   : portal instance
+    // - NULL         : no parent window
+    // - XDP_SCREENSHOT_FLAG_NONE : no special options
+    // - NULL         : no additional details
+    // - on_screenshot_ready : callback to be called when the capture is done
+    // - sd           : our data passed to the callback
     xdp_portal_take_screenshot(sd->portal, NULL, XDP_SCREENSHOT_FLAG_NONE, NULL,
         on_screenshot_ready, sd);
 
-    //Lance la boucle, en attente de la callback
+    // Start the async event loop and wait for the callback
     g_main_loop_run(loop);
 
     if (!sd->data)
     {
-        fprintf(stderr, "La capture d'écran a échoué.\n");
+        fprintf(stderr, "Screenshot capture failed.\n");
         return -1;
     }
     return 0;
 }
 ```
 
-Puis notre callback `on_screenshot_ready()`:
+Then the `on_screenshot_ready()` callback:
 
 ```c
-// Callback une fois que le screenshot a été fait
-// - GObject *source : l’objet qui a lancé l’opération => sd->portal
-// - GAsyncResult *result : Le résultat du screenshot
-// - gpointer user_data : notre screen_data qu'on a donné en argument
+// Callback called once the screenshot is complete
+// - GObject *source : the object that started the operation => sd->portal
+// - GAsyncResult *result : the result of the async screenshot
+// - gpointer user_data : our screen_data struct passed earlier
 void on_screenshot_ready(GObject *source, GAsyncResult *res,
     gpointer user_data)
 {
-    //On convertit au bon type
+    // Cast to the correct type
     struct screen_data *sd = user_data;
     GError *error = NULL;
 
-    //Termine l'opération de screenshot async et get l'URI de l'image
-    //XDP_PORTAL est simplement un cast d'un GObject* vers XdpPortal*  
+    // Finish the async screenshot and get the image URI
+    // XDP_PORTAL() is just a cast from GObject* to XdpPortal*
     gchar *uri = xdp_portal_take_screenshot_finish(XDP_PORTAL(source), res,
     &error);
 
     if (error)
     {
-        g_printerr("Erreur de capture d'écran: %s\n", error->message);
+        g_printerr("Screenshot error: %s\n", error->message);
         g_error_free(error);
         g_main_loop_quit(sd->loop);
         return;
     }
 
-	// Conversion d'un URI en chemin local
+    // Convert URI to local path
     gchar *path = g_filename_from_uri(uri, NULL, &error);
 
-    // On libère l’URI
+    // Free the URI
     g_free(uri);
 
     if (error)
     {
-        g_printerr("Erreur de conversion d'URI: %s\n", error->message);
+        g_printerr("URI conversion error: %s\n", error->message);
         g_error_free(error);
         g_main_loop_quit(sd->loop);
         return;
     }
 
-    //Lit le contenu du PNG dans notre buffer sd->data et update length
+    // Read PNG content into sd->data and update length
     if (!g_file_get_contents(path, (gchar**)&sd->data, &sd->length, &error))
     {
-        g_printerr("Échec de la lecture de %s: %s\n", path, error->message);
+        g_printerr("Failed to read %s: %s\n", path, error->message);
         g_error_free(error);
     }
 
-    //On free le path
+    // Free the path
     g_free(path);
 
-    //On quitte la boucle async permettant de débloquer capture_screenshot
+    // Exit the async loop to resume capture_screenshot()
     g_main_loop_quit(sd->loop);
 }
 ```
 
-### Et ensuite ?
+### What's next?
 
-Une fois la capture effectuée, l’image PNG est convertie en raw
-(ex : tableau de pixels RGBA), puis envoyée via UDP.
-Le serveur, de son côté, reçoit ces données et les écrit dans un fichier `.ppm`
-pour affichage.
+Once the capture is done, the PNG image is converted to raw format
+(RGBA pixel array), then sent over UDP.
+On the server side, the data is received and written to a `.ppm` file for
+display.
 
-Le code complet (client et serveur) est disponible sur un repo GitHub associé à
-l’article.
+The full code (client and server) is available on a GitHub repo linked to the
+article :
 
-<TODO insert lien du repo GIT*>
+[https://github.com/quentinrebergue/SharedScreen](Link to the Github repository)
 
 ## Conclusion
 
-Dans cet article, nous avons exploré le fonctionnement de la mémoire vidéo sous
-Linux, en partant du framebuffer jusqu’à son affichage à l’écran à travers le
-sous-système DRM.
-Nous avons aussi vu comment les compositeurs modernes prennent le relais dans
-la gestion de l’affichage et de la sécurité, et comment une application peut
-demander une capture d’écran via **xdg-desktop-portal** et **PipeWire**.
+In this article, we explored how video memory works on Linux — starting from
+framebuffer to screen display through the DRM subsystem.
+We also looked at how modern compositors handle both display and security
+management, and how an application can request a screenshot via
+**xdg-desktop-portal** and **PipeWire**.
 
-En nous appuyant sur **xdg-desktop-portal** et **PipeWire**, nous avons mis en
-place une méthode sécurisée pour capturer l’écran depuis une application non
-privilégiée.
-Enfin, nous avons commencé l’implémentation d’un programme de
-**partage d’écran minimal**, basé sur une seule capture d'écran.
+By relying on **xdg-desktop-portal** and **PipeWire**, we implemented a secure
+method for capturing the screen from an non-privileged application.
+Finally, we began building a **minimal screen sharing program**, based on a
+single screenshot.
 
-Ce partage d’écran minimal n’est qu’un point de départ : peut être dans un
-prochain article, on explorera comment gérer un flux vidéo en continu.
+This minimal screen sharing feature is only a starting point: perhaps in a
+future article, we'll explore how to handle a continuous video stream.
 
-## Bibliographie
+---
 
-https://dri.freedesktop.org/docs/drm/
-https://gitlab.freedesktop.org/mesa/drm
-https://flatpak.github.io/xdg-desktop-portal/
-https://pipewire.org/
-https://www.kernel.org/doc/html/latest/gpu/drm-kms.html
-https://docs.flatpak.org/libportal/t
-https://wayland.freedesktop.org/architecture.html
-https://docs.flatpak.org/en/latest/portals.html
-https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/Screen-Capture
-https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/home
-https://developer.gnome.org/gdk-pixbuf/stable/
-https://docs.gtk.org/glib/
-https://drewdevault.com/2018/07/29/KMS-DRM-tutorial.html
+## References
+
+[https://dri.freedesktop.org/docs/drm/](https://dri.freedesktop.org/docs/drm/)
+[https://gitlab.freedesktop.org/mesa/drm](https://gitlab.freedesktop.org/mesa/drm)
+[https://flatpak.github.io/xdg-desktop-portal/](https://flatpak.github.io/xdg-desktop-portal/)
+[https://pipewire.org/](https://pipewire.org/)
+[https://www.kernel.org/doc/html/latest/gpu/drm-kms.html](https://www.kernel.org/doc/html/latest/gpu/drm-kms.html)
+[https://docs.flatpak.org/libportal/t](https://docs.flatpak.org/libportal/t)
+[https://wayland.freedesktop.org/architecture.html](https://wayland.freedesktop.org/architecture.html)
+[https://docs.flatpak.org/en/latest/portals.html](https://docs.flatpak.org/en/latest/portals.html)
+[https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/Screen-Capture](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/Screen-Capture)
+[https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/home](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/home)
+[https://developer.gnome.org/gdk-pixbuf/stable/](https://developer.gnome.org/gdk-pixbuf/stable/)
+[https://docs.gtk.org/glib/](https://docs.gtk.org/glib/)
+[https://drewdevault.com/2018/07/29/KMS-DRM-tutorial.html](https://drewdevault.com/2018/07/29/KMS-DRM-tutorial.html)
